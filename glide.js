@@ -5,6 +5,23 @@
 
 /// <reference path="../cli/globals.d.ts" />
 
+const GlideCore = (() => {
+    const clamp01 = (value) => Math.min(1, Math.max(0, Number(value) || 0));
+    const clampDuration = (value) => {
+        const numeric = Number(value);
+        return Math.min(15, Math.max(1, Number.isFinite(numeric) ? numeric : 5));
+    };
+    const fadeOutGain = (progress) => Math.cos(clamp01(progress) * Math.PI / 2);
+    const fadeInGain = (progress) => Math.sin(clamp01(progress) * Math.PI / 2);
+
+    return { clampDuration, fadeOutGain, fadeInGain };
+})();
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { GlideCore };
+}
+
+if (typeof Spicetify !== "undefined") {
 (async function Glide() {
     // ─── Wait for Spicetify APIs ─────────────────────────────────────
     if (
@@ -584,3 +601,4 @@
     // Check for updates in the background
     checkForUpdates();
 })();
+}
