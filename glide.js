@@ -164,6 +164,24 @@ const GlideCore = (() => {
         return "fallback";
     };
 
+    const renderSettingsMarkup = ({ enabled, durationSec, status }) => `
+        <div class="g__row g__duration-row">
+            <span class="g__lbl">Glide</span>
+            <span class="g__val" id="g-val">${clampDuration(durationSec)}s</span>
+        </div>
+        <input class="g__sl" id="g-sl" type="range"
+            min="1" max="15" step="0.5" value="${clampDuration(durationSec)}"/>
+        <div class="g__ticks"><span class="g__tick">1s</span><span class="g__tick">5s</span><span class="g__tick">10s</span><span class="g__tick">15s</span></div>
+        <p class="g__sub">Seamless transition timing</p>
+        <p class="g__status" id="g-status">${status}</p>
+        <div class="g__div"></div>
+        <div class="g__row g__enable-row">
+            <span class="g__lbl">Enable Glide</span>
+            <button class="g__tgl ${enabled ? "on" : ""}" id="g-toggle"
+                role="switch" aria-checked="${enabled}"></button>
+        </div>
+    `;
+
     return {
         clampDuration,
         fadeOutGain,
@@ -174,6 +192,7 @@ const GlideCore = (() => {
         isFallbackEligible,
         maybeStartAutomatic,
         requestNext,
+        renderSettingsMarkup,
     };
 })();
 
@@ -537,6 +556,7 @@ if (typeof Spicetify !== "undefined") {
                 .g__sl::-webkit-slider-thumb:hover{transform:scale(1.25)}
                 .g__ticks{display:flex;justify-content:space-between;margin-bottom:20px}
                 .g__tick{font-size:10px;color:var(--spice-subtext,#b3b3b3);opacity:.5}
+                .g__status{font-size:11px;color:#1DB954;margin:-8px 0 14px;text-align:center}
                 .g__div{height:1px;background:rgba(255,255,255,.08);margin:4px 0 14px}
                 .g__tgl{position:relative;width:38px;height:20px;background:var(--spice-button-disabled,#535353);border-radius:10px;border:none;cursor:pointer;transition:background .2s;padding:0;flex-shrink:0}
                 .g__tgl.on{background:#1DB954}
@@ -545,54 +565,37 @@ if (typeof Spicetify !== "undefined") {
                 .g__foot{font-size:11px;color:var(--spice-subtext,#b3b3b3);opacity:.4;text-align:center;margin-top:18px}
             </style>
             <div class="g">
-                <div class="g__row">
-                    <span class="g__lbl">Glide</span>
-                    <span class="g__val" id="g-val">${earlyStartSec}s</span>
-                </div>
-                <input type="range" class="g__sl" id="g-sl"
-                    min="${MIN_EARLY}" max="${MAX_EARLY}" step="0.5" value="${earlyStartSec}"/>
-                <div class="g__ticks">
-                    <span class="g__tick">1s</span><span class="g__tick">5s</span>
-                    <span class="g__tick">10s</span><span class="g__tick">15s</span>
-                </div>
-                <p class="g__sub">Seamless transition timing</p>
-                <div class="g__div"></div>
-                
-                <div class="g__row" style="margin-bottom: 2px;">
-                    <span class="g__lbl">Smart Gapless (Albums)</span>
-                    <button class="g__tgl ${smartGapless ? "on" : ""}" id="g-gapless-tgl"></button>
-                </div>
-                <p class="g__sub" style="margin-bottom: 12px; margin-top: 0;">Preserve gapless playback for consecutive album tracks.</p>
-
-                <div class="g__row" style="margin-top: 6px;">
-                    <span class="g__lbl">Enable Glide</span>
-                    <button class="g__tgl ${isEnabled ? "on" : ""}" id="g-toggle"></button>
-                </div>
-                <div class="g__foot">Glide v3.2.0</div>
+                ${GlideCore.renderSettingsMarkup({
+                    enabled: isEnabled,
+                    durationSec: earlyStartSec,
+                    status: capabilityStatus === "checking"
+                        ? "Checking Spotify…"
+                        : capabilityStatus === "native"
+                            ? "Native crossfade"
+                            : "Fallback fade",
+                })}
+                <div class="g__foot">Glide v4.0.0</div>
             </div>`;
 
         const sl = container.querySelector("#g-sl");
         const val = container.querySelector("#g-val");
-        sl.addEventListener("input", () => {
+        sl.addEventListener("input", async () => {
             const v = parseFloat(sl.value);
             val.textContent = `${v}s`;
             earlyStartSec = v;
-            crossfadeSec = v;   // keep crossfade in sync with the single slider
+            crossfadeSec = v;
             saveSettings();
-            enforceCrossfade(); // silently sync Spotify's crossfade duration
-        });
-
-        const gapTgl = container.querySelector("#g-gapless-tgl");
-        gapTgl.addEventListener("click", () => {
-            smartGapless = !smartGapless;
-            gapTgl.classList.toggle("on", smartGapless);
-            saveSettings();
+            await enforceCrossfade();
+            container.querySelector("#g-status").textContent =
+                capabilityStatus === "native" ? "Native crossfade" : "Fallback fade";
         });
 
         const toggle = container.querySelector("#g-toggle");
-        toggle.addEventListener("click", () => {
+        toggle.addEventListener("click", async () => {
             isEnabled = !isEnabled;
             toggle.classList.toggle("on", isEnabled);
+            toggle.setAttribute("aria-checked", String(isEnabled));
+            if (!isEnabled) await transitionController.cancel("disabled");
             saveSettings();
             updatePlaybarButton();
             updateMenuState();

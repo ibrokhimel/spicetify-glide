@@ -254,3 +254,20 @@ test("manual Next uses only an explicitly verified native transition", async () 
     assert.equal(nativeCalls, 1);
     assert.equal(fallbackCalls, 1);
 });
+
+test("settings markup exposes the approved controls and status", () => {
+    const markup = GlideCore.renderSettingsMarkup({
+        enabled: true,
+        durationSec: 5,
+        status: "Native crossfade",
+    });
+
+    assert.match(markup, /Glide/);
+    assert.match(markup, /5s/);
+    assert.match(markup, /min="1"/);
+    assert.match(markup, /max="15"/);
+    assert.match(markup, /Seamless transition timing/);
+    assert.match(markup, /Enable Glide/);
+    assert.match(markup, /Native crossfade/);
+    assert.doesNotMatch(markup, /Smart Gapless/);
+});
