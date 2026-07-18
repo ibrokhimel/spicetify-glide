@@ -14,7 +14,55 @@ const GlideCore = (() => {
     const fadeOutGain = (progress) => Math.cos(clamp01(progress) * Math.PI / 2);
     const fadeInGain = (progress) => Math.sin(clamp01(progress) * Math.PI / 2);
 
-    return { clampDuration, fadeOutGain, fadeInGain };
+    const loadSettings = (storage) => {
+        const enabledValue = storage.get("glide:enabled");
+        const storedDuration = storage.get("glide:duration");
+        const legacyDuration = storage.get("glide:earlyStart");
+        const durationSec = clampDuration(storedDuration ?? legacyDuration ?? 5);
+
+        storage.set("glide:duration", String(durationSec));
+
+        return {
+            enabled: enabledValue === null ? true : enabledValue === "true",
+            durationSec,
+        };
+    };
+
+    const probeNativeCapability = async (platform, durationSec, logger = console) => {
+        const result = {
+            automatic: false,
+            manual: typeof platform?.PlayerAPI?.crossfadeToNext === "function",
+        };
+        const config = platform?.ConfigAPI;
+
+        if (
+            typeof config?.setAccountSetting !== "function" ||
+            typeof config?.getAccountSetting !== "function"
+        ) {
+            return result;
+        }
+
+        const durationMs = clampDuration(durationSec) * 1000;
+        try {
+            await config.setAccountSetting("audio.crossfade_v2", true);
+            await config.setAccountSetting("audio.crossfade.time_v2", durationMs);
+            const enabled = await config.getAccountSetting("audio.crossfade_v2");
+            const configuredDuration = await config.getAccountSetting("audio.crossfade.time_v2");
+            result.automatic = enabled === true && Number(configuredDuration) === durationMs;
+        } catch (error) {
+            logger?.warn?.("[Glide] Native crossfade probe failed", error);
+        }
+
+        return result;
+    };
+
+    return {
+        clampDuration,
+        fadeOutGain,
+        fadeInGain,
+        loadSettings,
+        probeNativeCapability,
+    };
 })();
 
 if (typeof module !== "undefined" && module.exports) {
