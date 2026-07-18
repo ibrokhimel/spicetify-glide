@@ -56,12 +56,88 @@ const GlideCore = (() => {
         return result;
     };
 
+    const createTransitionController = (deps) => {
+        let token = 0;
+        let active = null;
+
+        const animate = (transition, durationMs, gain) => new Promise((resolve) => {
+            const startedAt = deps.now();
+            transition.settle = resolve;
+
+            const step = () => {
+                if (transition.token !== token) {
+                    resolve();
+                    return;
+                }
+
+                const progress = Math.min(1, Math.max(0, (deps.now() - startedAt) / durationMs));
+                deps.setVolume(transition.volume * gain(progress));
+                if (progress >= 1) {
+                    transition.settle = null;
+                    resolve();
+                    return;
+                }
+                deps.requestFrame(step);
+            };
+
+            deps.requestFrame(step);
+        });
+
+        const cancel = async (_reason, options = {}) => {
+            const transition = active;
+            if (!transition) {
+                if (options.advance) await deps.next();
+                return;
+            }
+
+            token += 1;
+            active = null;
+            deps.setVolume(transition.volume);
+            transition.settle?.();
+            if (options.advance) await deps.next();
+        };
+
+        const startFallback = async (_reason) => {
+            if (active) return;
+
+            const transition = {
+                token: ++token,
+                volume: deps.getVolume(),
+                settle: null,
+            };
+            active = transition;
+            const halfDuration = Math.max(1, deps.durationMs() / 2);
+
+            try {
+                await animate(transition, halfDuration, fadeOutGain);
+                if (transition.token !== token) return;
+                await deps.next();
+                if (transition.token !== token) return;
+                await deps.waitForSongChange();
+                if (transition.token !== token) return;
+                await animate(transition, halfDuration, fadeInGain);
+            } finally {
+                if (transition.token === token) {
+                    deps.setVolume(transition.volume);
+                    active = null;
+                }
+            }
+        };
+
+        return {
+            startFallback,
+            cancel,
+            state: () => active ? "fallback" : "idle",
+        };
+    };
+
     return {
         clampDuration,
         fadeOutGain,
         fadeInGain,
         loadSettings,
         probeNativeCapability,
+        createTransitionController,
     };
 })();
 

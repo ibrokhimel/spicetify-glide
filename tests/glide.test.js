@@ -86,3 +86,91 @@ test("does not trust native setters without a read path", async () => {
         { automatic: false, manual: false },
     );
 });
+
+test("fallback fades out, advances once, and fades in to the captured volume", async () => {
+    let time = 0;
+    let advances = 0;
+    const volumes = [];
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => time,
+        requestFrame: (callback) => {
+            time += 250;
+            queueMicrotask(callback);
+        },
+        getVolume: () => 0.8,
+        setVolume: (volume) => volumes.push(volume),
+        next: async () => { advances += 1; },
+        waitForSongChange: async () => {},
+    });
+
+    await controller.startFallback("automatic");
+
+    assert.equal(advances, 1);
+    assert.equal(controller.state(), "idle");
+    assert.ok(Math.abs(volumes[0] - 0.8 * Math.SQRT1_2) < 1e-12);
+    assert.ok(Math.abs(volumes.at(-1) - 0.8) < 1e-12);
+});
+
+test("cancelling fallback restores volume and prevents an advance", async () => {
+    const frames = [];
+    const volumes = [];
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => 0,
+        requestFrame: (callback) => frames.push(callback),
+        getVolume: () => 0.6,
+        setVolume: (volume) => volumes.push(volume),
+        next: async () => assert.fail("cancelled transition must not advance"),
+        waitForSongChange: async () => {},
+    });
+
+    const transition = controller.startFallback("automatic");
+    await controller.cancel("pause");
+    await transition;
+
+    assert.equal(controller.state(), "idle");
+    assert.equal(volumes.at(-1), 0.6);
+});
+
+test("a repeated Next cancels fallback and advances exactly once", async () => {
+    const frames = [];
+    let advances = 0;
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => 0,
+        requestFrame: (callback) => frames.push(callback),
+        getVolume: () => 0.7,
+        setVolume() {},
+        next: async () => { advances += 1; },
+        waitForSongChange: async () => {},
+    });
+
+    const transition = controller.startFallback("manual");
+    await controller.cancel("repeated-next", { advance: true });
+    await transition;
+
+    assert.equal(advances, 1);
+    assert.equal(controller.state(), "idle");
+});
+
+test("fallback restores volume when advancing fails", async () => {
+    let time = 0;
+    const volumes = [];
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => time,
+        requestFrame: (callback) => {
+            time += 500;
+            queueMicrotask(callback);
+        },
+        getVolume: () => 0.4,
+        setVolume: (volume) => volumes.push(volume),
+        next: async () => { throw new Error("advance failed"); },
+        waitForSongChange: async () => {},
+    });
+
+    await assert.rejects(controller.startFallback("automatic"), /advance failed/);
+    assert.equal(volumes.at(-1), 0.4);
+    assert.equal(controller.state(), "idle");
+});
