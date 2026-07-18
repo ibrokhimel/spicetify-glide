@@ -246,18 +246,24 @@ const GlideCore = (() => {
         return Math.abs((currentProgress - previousProgress) - elapsedMs) > toleranceMs;
     };
 
-    const installNextInterceptor = (player, replacement) => {
-        const original = player.next;
+    const installMethodInterceptor = (target, methodName, replacement) => {
+        const original = target[methodName];
+        const hadOwnMethod = Object.hasOwn(target, methodName);
         try {
-            player.next = replacement;
+            target[methodName] = replacement;
         } catch (_error) {
             return null;
         }
-        if (player.next !== replacement) return null;
+        if (target[methodName] !== replacement) return null;
         return () => {
-            if (player.next === replacement) player.next = original;
+            if (target[methodName] !== replacement) return;
+            if (hadOwnMethod) target[methodName] = original;
+            else delete target[methodName];
         };
     };
+
+    const installNextInterceptor = (player, replacement) =>
+        installMethodInterceptor(player, "next", replacement);
 
     const isExpectedTrackChange = (sourceUri, expectedUri, actualUri) => {
         if (!actualUri || actualUri === sourceUri) return false;
@@ -294,6 +300,7 @@ const GlideCore = (() => {
         maybeStartAutomatic,
         requestNext,
         isProgressDiscontinuity,
+        installMethodInterceptor,
         installNextInterceptor,
         isExpectedTrackChange,
         renderSettingsMarkup,
@@ -314,6 +321,7 @@ if (typeof Spicetify !== "undefined") {
         !Spicetify?.Player?.setVolume ||
         !Spicetify?.Player?.next ||
         !Spicetify?.Player?.isPlaying ||
+        !Spicetify?.Platform?.PlayerAPI?.skipToNext ||
         !Spicetify?.Playbar ||
         !Spicetify?.PopupModal ||
         !Spicetify?.LocalStorage ||
@@ -342,7 +350,9 @@ if (typeof Spicetify !== "undefined") {
     let songChangeWaiters = [];
     let playbarButton = null;
     let menuItem = null;
-    const rawNext = Spicetify.Player.next.bind(Spicetify.Player);
+    const rawNext = Spicetify.Platform.PlayerAPI.skipToNext.bind(
+        Spicetify.Platform.PlayerAPI,
+    );
 
     const saveSettings = () => {
         Spicetify.LocalStorage.set("glide:enabled", String(enabled));
@@ -545,21 +555,12 @@ if (typeof Spicetify !== "undefined") {
         menuItem.register();
     }
 
-    const restoreNext = GlideCore.installNextInterceptor(
-        Spicetify.Player,
+    const restoreNext = GlideCore.installMethodInterceptor(
+        Spicetify.Platform.PlayerAPI,
+        "skipToNext",
         requestManualNext,
     );
-    if (!restoreNext) warn("Player.next interception is unavailable");
-
-    document.addEventListener("click", (event) => {
-        const nextButton = event.target?.closest?.(
-            '[data-testid="control-button-skip-forward"]',
-        );
-        if (!nextButton || !enabled) return;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        requestManualNext().catch((nextError) => error("Visible Next failed:", nextError));
-    }, true);
+    if (!restoreNext) warn("PlayerAPI.skipToNext interception is unavailable");
 
     Spicetify.Player.addEventListener("onprogress", () => {
         checkProgress().catch((progressError) => error("Progress check failed:", progressError));

@@ -472,6 +472,27 @@ test("Next interception verifies assignment and can be restored", () => {
     assert.equal(GlideCore.installNextInterceptor(locked, replacement), null);
 });
 
+test("method interception overrides a writable prototype method", () => {
+    class PlayerAPI {
+        skipToNext() {
+            return "original";
+        }
+    }
+    const player = new PlayerAPI();
+    const replacement = () => "replacement";
+
+    const restore = GlideCore.installMethodInterceptor(
+        player,
+        "skipToNext",
+        replacement,
+    );
+
+    assert.equal(player.skipToNext(), "replacement");
+    restore();
+    assert.equal(player.skipToNext(), "original");
+    assert.equal(Object.hasOwn(player, "skipToNext"), false);
+});
+
 test("song-change confirmation rejects an unrelated target", () => {
     assert.equal(
         GlideCore.isExpectedTrackChange("spotify:track:a", "spotify:track:b", "spotify:track:b"),
