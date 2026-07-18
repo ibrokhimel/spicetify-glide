@@ -1,586 +1,620 @@
 // NAME: Glide
 // AUTHOR: Project Glide
-// VERSION: 3.2.0
-// DESCRIPTION: Apple Music-style seamless transitions. True audio overlap via native crossfade.
+// VERSION: 4.0.0
+// DESCRIPTION: Verified native crossfade with an equal-power fallback.
 
 /// <reference path="../cli/globals.d.ts" />
 
+const GlideCore = (() => {
+    const clamp01 = (value) => Math.min(1, Math.max(0, Number(value) || 0));
+    const clampDuration = (value) => {
+        const numeric = Number(value);
+        return Math.min(15, Math.max(1, Number.isFinite(numeric) ? numeric : 5));
+    };
+    const fadeOutGain = (progress) => Math.cos(clamp01(progress) * Math.PI / 2);
+    const fadeInGain = (progress) => Math.sin(clamp01(progress) * Math.PI / 2);
+
+    const loadSettings = (storage) => {
+        const enabledValue = storage.get("glide:enabled");
+        const storedDuration = storage.get("glide:duration");
+        const legacyDuration = storage.get("glide:earlyStart");
+        const durationSec = clampDuration(storedDuration ?? legacyDuration ?? 5);
+        storage.set("glide:duration", String(durationSec));
+        return {
+            enabled: enabledValue === null ? true : enabledValue === "true",
+            durationSec,
+        };
+    };
+
+    const probeNativeCapability = async (platform, durationSec, logger = console) => {
+        const result = {
+            automatic: false,
+            manual: typeof platform?.PlayerAPI?.crossfadeToNext === "function",
+        };
+        const unwrap = (setting) => {
+            if (setting && typeof setting === "object") {
+                for (const key of ["value", "boolValue", "numberValue"]) {
+                    if (key in setting) return unwrap(setting[key]);
+                }
+            }
+            return setting;
+        };
+        const config = platform?.ConfigAPI;
+        const durationMs = clampDuration(durationSec) * 1000;
+
+        if (
+            typeof config?.setAccountSetting === "function" &&
+            typeof config?.getAccountSetting === "function"
+        ) {
+            try {
+                await config.setAccountSetting("audio.crossfade_v2", true);
+                await config.setAccountSetting("audio.crossfade.time_v2", durationMs);
+                const enabled = unwrap(await config.getAccountSetting("audio.crossfade_v2"));
+                const configuredDuration = unwrap(
+                    await config.getAccountSetting("audio.crossfade.time_v2"),
+                );
+                result.automatic = enabled === true && Number(configuredDuration) === durationMs;
+            } catch (error) {
+                logger?.warn?.("[Glide] ConfigAPI crossfade probe failed", error);
+            }
+            if (result.automatic) return result;
+        }
+
+        const preferences = platform?.PlayerAPI?._prefs;
+        if (
+            typeof preferences?.setCrossfade === "function" &&
+            typeof preferences?.getCrossfade === "function"
+        ) {
+            try {
+                await preferences.setCrossfade(true, clampDuration(durationSec));
+                const configured = await preferences.getCrossfade();
+                const enabled = unwrap(configured?.enabled ?? configured?.isEnabled);
+                const duration = unwrap(
+                    configured?.duration ?? configured?.durationSec ?? configured?.duration_ms,
+                );
+                result.automatic = enabled === true &&
+                    (Number(duration) === clampDuration(durationSec) ||
+                        Number(duration) === durationMs);
+            } catch (error) {
+                logger?.warn?.("[Glide] Player preferences crossfade probe failed", error);
+            }
+        }
+
+        return result;
+    };
+
+    const createLatestProbe = (probe, publish) => {
+        let generation = 0;
+        return async (...args) => {
+            const current = ++generation;
+            const result = await probe(...args);
+            if (current === generation) publish(result);
+            return result;
+        };
+    };
+
+    const createTransitionController = (deps) => {
+        let token = 0;
+        let active = null;
+        const reportError = (error) => deps.onError?.(error);
+        const restoreVolume = (transition) => {
+            try {
+                deps.setVolume(transition.volume);
+            } catch (error) {
+                reportError(error);
+            }
+        };
+
+        const animate = (transition, durationMs, gain) => new Promise((resolve, reject) => {
+            const startedAt = deps.now();
+            transition.settle = resolve;
+            const step = () => {
+                if (transition.token !== token) {
+                    resolve();
+                    return;
+                }
+                const progress = Math.min(1, Math.max(0, (deps.now() - startedAt) / durationMs));
+                try {
+                    deps.setVolume(transition.volume * gain(progress));
+                } catch (error) {
+                    transition.settle = null;
+                    reject(error);
+                    return;
+                }
+                if (progress >= 1) {
+                    transition.settle = null;
+                    resolve();
+                    return;
+                }
+                deps.requestFrame(step);
+            };
+            deps.requestFrame(step);
+        });
+
+        const cancel = async (_reason, options = {}) => {
+            const transition = active;
+            if (!transition) {
+                if (options.advance) await deps.next();
+                return;
+            }
+            token += 1;
+            active = null;
+            const settle = transition.settle;
+            transition.settle = null;
+            restoreVolume(transition);
+            settle?.();
+            if (options.advance) await deps.next();
+        };
+
+        const startFallback = async (_reason) => {
+            if (active) return;
+            const transition = {
+                token: ++token,
+                volume: deps.getVolume(),
+                settle: null,
+                phase: "fade-out",
+            };
+            active = transition;
+            const totalDuration = Math.max(2, deps.durationMs());
+            const startedAt = deps.now();
+            const halfDuration = totalDuration / 2;
+            try {
+                await animate(transition, halfDuration, fadeOutGain);
+                if (transition.token !== token) return;
+                transition.phase = "awaiting-change";
+                const songChanged = deps.waitForSongChange();
+                await deps.next();
+                if (transition.token !== token) return;
+                const confirmed = await songChanged;
+                if (transition.token !== token) return;
+                if (confirmed === false) return;
+                transition.phase = "fade-in";
+                const remainingDuration = Math.max(1, totalDuration - (deps.now() - startedAt));
+                await animate(transition, remainingDuration, fadeInGain);
+            } finally {
+                if (transition.token === token) {
+                    active = null;
+                    restoreVolume(transition);
+                }
+            }
+        };
+
+        const beginFallback = (reason) => {
+            if (active) return false;
+            startFallback(reason).catch((error) => reportError(error));
+            return true;
+        };
+
+        return {
+            startFallback,
+            beginFallback,
+            cancel,
+            state: () => active ? "fallback" : "idle",
+            expectsSongChange: () => active?.phase === "awaiting-change",
+        };
+    };
+
+    const isPlayableTarget = (item) => {
+        if (!item) return false;
+        const metadata = item.contextTrack?.metadata || item.metadata || {};
+        if (item.isPlayable === false || item.is_playable === false) return false;
+        if (String(metadata.is_playable).toLowerCase() === "false") return false;
+        if (String(metadata.is_restricted).toLowerCase() === "true") return false;
+        return Boolean(item.uri || item.contextTrack?.uri || metadata.uri);
+    };
+
+    const isFallbackEligible = (item, durationMs, progressMs, totalMs, nextItem) => {
+        if (!item || item.type !== "track") return false;
+        if (item.isLocal || String(item.uri || "").startsWith("spotify:local:")) return false;
+        if (nextItem !== undefined && !isPlayableTarget(nextItem)) return false;
+        if (![durationMs, progressMs, totalMs].every(Number.isFinite)) return false;
+        if (durationMs <= 0 || totalMs < durationMs * 2) return false;
+        const remaining = totalMs - progressMs;
+        return remaining > 0 && remaining <= durationMs;
+    };
+
+    const maybeStartAutomatic = (options) => {
+        if (!options.enabled || options.nativeAutomatic) return false;
+        if (!isFallbackEligible(
+            options.item,
+            options.durationMs,
+            options.progressMs,
+            options.totalMs,
+            options.nextItem,
+        )) {
+            return false;
+        }
+        return options.startFallback("automatic") !== false;
+    };
+
+    const requestNext = async (options) => {
+        if (options.nativeManual && typeof options.crossfadeToNext === "function") {
+            await options.crossfadeToNext();
+            return "native";
+        }
+        await options.startFallback("manual");
+        return "fallback";
+    };
+
+    const isProgressDiscontinuity = (
+        previousProgress,
+        currentProgress,
+        elapsedMs,
+        toleranceMs = 1500,
+    ) => {
+        if (![previousProgress, currentProgress, elapsedMs].every(Number.isFinite)) return false;
+        return Math.abs((currentProgress - previousProgress) - elapsedMs) > toleranceMs;
+    };
+
+    const installNextInterceptor = (player, replacement) => {
+        const original = player.next;
+        try {
+            player.next = replacement;
+        } catch (_error) {
+            return null;
+        }
+        if (player.next !== replacement) return null;
+        return () => {
+            if (player.next === replacement) player.next = original;
+        };
+    };
+
+    const isExpectedTrackChange = (sourceUri, expectedUri, actualUri) => {
+        if (!actualUri || actualUri === sourceUri) return false;
+        return expectedUri ? actualUri === expectedUri : true;
+    };
+
+    const renderSettingsMarkup = ({ enabled, durationSec, status }) => `
+        <div class="g__row">
+            <span class="g__label">Glide</span>
+            <span class="g__value" id="g-value">${clampDuration(durationSec)}s</span>
+        </div>
+        <input class="g__range" id="g-range" type="range"
+            min="1" max="15" step="0.5" value="${clampDuration(durationSec)}"/>
+        <div class="g__ticks"><span>1s</span><span>5s</span><span>10s</span><span>15s</span></div>
+        <p class="g__helper">Seamless transition timing</p>
+        <p class="g__status" id="g-status">${status}</p>
+        <div class="g__divider"></div>
+        <div class="g__row">
+            <span class="g__label">Enable Glide</span>
+            <button class="g__toggle ${enabled ? "on" : ""}" id="g-toggle"
+                role="switch" aria-checked="${enabled}"></button>
+        </div>
+    `;
+
+    return {
+        clampDuration,
+        fadeOutGain,
+        fadeInGain,
+        loadSettings,
+        probeNativeCapability,
+        createLatestProbe,
+        createTransitionController,
+        isFallbackEligible,
+        maybeStartAutomatic,
+        requestNext,
+        isProgressDiscontinuity,
+        installNextInterceptor,
+        isExpectedTrackChange,
+        renderSettingsMarkup,
+    };
+})();
+
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { GlideCore };
+}
+
+if (typeof Spicetify !== "undefined") {
 (async function Glide() {
-    // ─── Wait for Spicetify APIs ─────────────────────────────────────
     if (
         !Spicetify?.Player?.addEventListener ||
         !Spicetify?.Player?.getProgress ||
         !Spicetify?.Player?.getDuration ||
         !Spicetify?.Player?.getVolume ||
+        !Spicetify?.Player?.setVolume ||
         !Spicetify?.Player?.next ||
         !Spicetify?.Player?.isPlaying ||
         !Spicetify?.Playbar ||
         !Spicetify?.PopupModal ||
         !Spicetify?.LocalStorage ||
-        !Spicetify?.CosmosAsync ||
         !Spicetify?.Platform
     ) {
         setTimeout(Glide, 300);
         return;
     }
 
-    // ─── Logger ──────────────────────────────────────────────────────
     const LOG = "[Glide]";
-    const log = (...a) => console.log(`%c${LOG}`, "color:#1DB954;font-weight:bold", ...a);
-    const warn = (...a) => console.warn(LOG, ...a);
-    const err = (...a) => console.error(LOG, ...a);
+    const log = (...args) => console.log(LOG, ...args);
+    const warn = (...args) => console.warn(LOG, ...args);
+    const error = (...args) => console.error(LOG, ...args);
+    const ICON = `<svg viewBox="0 0 16 16" height="16" width="16" fill="currentColor">
+        <path d="M9.3 1 3 9h4l-.7 6L13 6H9.2z"/>
+    </svg>`;
 
-    // ─── Constants ───────────────────────────────────────────────────
-    const STORAGE = {
-        ENABLED: "glide:enabled",
-        EARLY_START: "glide:earlyStart",
-        CROSSFADE_DURATION: "glide:crossfadeDuration",
+    const settings = GlideCore.loadSettings(Spicetify.LocalStorage);
+    let enabled = settings.enabled;
+    let durationSec = settings.durationSec;
+    let capabilities = { automatic: false, manual: false };
+    let capabilityStatus = "checking";
+    let automaticTrackUri = null;
+    let lastProgress = 0;
+    let lastProgressAt = 0;
+    let songChangeWaiters = [];
+    let playbarButton = null;
+    let menuItem = null;
+    const rawNext = Spicetify.Player.next.bind(Spicetify.Player);
+
+    const saveSettings = () => {
+        Spicetify.LocalStorage.set("glide:enabled", String(enabled));
+        Spicetify.LocalStorage.set("glide:duration", String(durationSec));
     };
-    const MIN_EARLY = 1;      // seconds
-    const MAX_EARLY = 15;
-    const DEFAULT_EARLY = 5;  // seconds
-    const MIN_CF = 1;         // seconds  
-    const MAX_CF = 12;
-    const DEFAULT_CF = 5;     // seconds
-    const HEARTBEAT_MS = 400;
 
-    // ─── SVG Icons ───────────────────────────────────────────────────
-    const ICON_ON = `<svg viewBox="0 0 16 16" height="16" width="16" fill="currentColor">
-        <path d="M2 4.5A2.5 2.5 0 0 1 4.5 2h1.38a2.5 2.5 0 0 1 2.236 1.382l1.768 3.536a.5.5 0 0 0 .448.276H11.5a1.5 1.5 0 0 1 0 3h-1.19a2.5 2.5 0 0 1-2.236-1.382L6.306 5.276A.5.5 0 0 0 5.858 5H4.5A1.5 1.5 0 0 0 3 6.5v3A1.5 1.5 0 0 0 4.5 11h.19a.5.5 0 0 0 .447-.276L5.691 9.5h1.118l-.829 1.658A2.5 2.5 0 0 1 3.743 12.5H4.5A2.5 2.5 0 0 1 2 10V4.5z"/>
-        <circle cx="13" cy="4" r="2" fill="#1DB954"/>
-    </svg>`;
-    const ICON_OFF = `<svg viewBox="0 0 16 16" height="16" width="16" fill="currentColor">
-        <path d="M2 4.5A2.5 2.5 0 0 1 4.5 2h1.38a2.5 2.5 0 0 1 2.236 1.382l1.768 3.536a.5.5 0 0 0 .448.276H11.5a1.5 1.5 0 0 1 0 3h-1.19a2.5 2.5 0 0 1-2.236-1.382L6.306 5.276A.5.5 0 0 0 5.858 5H4.5A1.5 1.5 0 0 0 3 6.5v3A1.5 1.5 0 0 0 4.5 11h.19a.5.5 0 0 0 .447-.276L5.691 9.5h1.118l-.829 1.658A2.5 2.5 0 0 1 3.743 12.5H4.5A2.5 2.5 0 0 1 2 10V4.5z" opacity="0.4"/>
-    </svg>`;
+    const waitForSongChange = () => new Promise((resolve) => {
+        const entry = {
+            sourceUri: Spicetify.Player.data?.item?.uri || null,
+            expectedUri: Spicetify.Queue?.nextTracks?.[0]?.uri ||
+                Spicetify.Queue?.nextTracks?.[0]?.contextTrack?.uri ||
+                null,
+            resolve: (confirmed) => {
+                clearTimeout(timeout);
+                resolve(confirmed);
+            },
+        };
+        const timeout = setTimeout(() => {
+            songChangeWaiters = songChangeWaiters.filter((waiter) => waiter !== entry);
+            resolve(false);
+        }, 3000);
+        songChangeWaiters.push(entry);
+    });
 
-    // ─── State ────────────────────────────────────────────────────────
-    let isEnabled = true;
-    let smartGapless = true;        // v3.2: Disable crossfade for consecutive album tracks
-    let earlyStartSec = DEFAULT_EARLY;
-    let crossfadeSec = DEFAULT_CF;
-    let hasSkipped = false;         // Prevents re-triggering for the same song
-    let lastSkippedUri = null;      // URI of the song we triggered the skip from
-    let spotifyCrossfadeStatus = "unknown"; // "enabled", "disabled", "unknown"
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => durationSec * 1000,
+        now: () => performance.now(),
+        requestFrame: (callback) => requestAnimationFrame(callback),
+        getVolume: () => Spicetify.Player.getVolume(),
+        setVolume: (volume) => Spicetify.Player.setVolume(volume),
+        next: () => rawNext(),
+        waitForSongChange,
+    });
 
-    // ─── Settings Persistence ────────────────────────────────────────
-    function loadSettings() {
-        try {
-            const e = Spicetify.LocalStorage.get(STORAGE.ENABLED);
-            if (e !== null) isEnabled = e === "true";
+    const statusCopy = () => capabilityStatus === "checking"
+        ? "Checking Spotify…"
+        : capabilityStatus === "native"
+            ? "Native crossfade"
+            : "Fallback fade";
 
-            const sg = Spicetify.LocalStorage.get("glide:smartGapless");
-            if (sg !== null) smartGapless = sg === "true";
+    const runCapabilityProbe = GlideCore.createLatestProbe(
+        (seconds) => GlideCore.probeNativeCapability(
+            Spicetify.Platform,
+            seconds,
+            { warn },
+        ),
+        (result) => {
+            capabilities = result;
+            capabilityStatus = result.automatic ? "native" : "fallback";
+            log("Transition capability:", result);
+        },
+    );
 
-            const es = Spicetify.LocalStorage.get(STORAGE.EARLY_START);
-            if (es !== null) {
-                const v = parseFloat(es);
-                if (!isNaN(v) && v >= MIN_EARLY && v <= MAX_EARLY) earlyStartSec = v;
-            }
+    const probeCapability = async () => {
+        capabilityStatus = "checking";
+        await runCapabilityProbe(durationSec);
+    };
 
-            const cf = Spicetify.LocalStorage.get(STORAGE.CROSSFADE_DURATION);
-            if (cf !== null) {
-                const v = parseFloat(cf);
-                if (!isNaN(v) && v >= MIN_CF && v <= MAX_CF) crossfadeSec = v;
-            }
+    const normalizedItem = () => {
+        const item = Spicetify.Player.data?.item;
+        const uri = item?.uri || "";
+        const inferredType = uri.startsWith("spotify:track:") ? "track"
+            : uri.startsWith("spotify:episode:") ? "episode"
+                : item?.type;
+        return item ? { ...item, type: inferredType } : null;
+    };
 
-            log("Settings loaded:", { isEnabled, earlyStartSec, crossfadeSec });
-        } catch (e) {
-            err("Load settings failed:", e);
-        }
-    }
-
-    function saveSettings() {
-        try {
-            Spicetify.LocalStorage.set(STORAGE.ENABLED, String(isEnabled));
-            Spicetify.LocalStorage.set("glide:smartGapless", String(smartGapless));
-            Spicetify.LocalStorage.set(STORAGE.EARLY_START, String(earlyStartSec));
-            Spicetify.LocalStorage.set(STORAGE.CROSSFADE_DURATION, String(crossfadeSec));
-        } catch (e) {
-            err("Save settings failed:", e);
-        }
-    }
-
-    // ─── Zero-Touch Auto-Crossfade Guardian ──────────────────────────
-    // Aggressively ensures Spotify's native crossfade is ON without user action.
-    async function enforceCrossfade() {
-        if (!isEnabled) return;
-        const durationMs = crossfadeSec * 1000;
-
-        try {
-            // Layer 1: The Modern XPUI ConfigAPI
-            if (Spicetify.Platform?.ConfigAPI?.setAccountSetting) {
-                await Spicetify.Platform.ConfigAPI.setAccountSetting("audio.crossfade_v2", true);
-                await Spicetify.Platform.ConfigAPI.setAccountSetting("audio.crossfade.time_v2", durationMs);
-                log("Zero-Touch: ConfigAPI forced crossfade ON");
-                return true;
-            }
-        } catch (e) {
-            warn("Zero-Touch: ConfigAPI hook failed:", e.message);
-        }
-
-        try {
-            // Layer 2: PlayerAPI Preferences
-            if (Spicetify.Platform?.PlayerAPI?._prefs?.setCrossfade) {
-                Spicetify.Platform.PlayerAPI._prefs.setCrossfade(true, crossfadeSec);
-                log("Zero-Touch: PlayerAPI forced crossfade ON");
-                return true;
-            }
-        } catch (e) {
-            warn("Zero-Touch: PlayerAPI hook failed:", e.message);
-        }
-
-        try {
-            // Layer 3: Cosmos Main Override
-            await Spicetify.CosmosAsync.post("sp://player/v2/main", {
-                crossfade: { enabled: true, duration_ms: durationMs }
-            });
-            log("Zero-Touch: Cosmos forced crossfade ON");
-            return true;
-        } catch (e) {
-            warn("Zero-Touch: Cosmos Main hook failed:", e.message);
-        }
-
-        try {
-            // Layer 4: Cosmos Connect Override
-            await Spicetify.CosmosAsync.put("sp://connect/v1/player/crossfade", {
-                enabled: true, duration_ms: durationMs
-            });
-            log("Zero-Touch: Connect forced crossfade ON");
-            return true;
-        } catch (e) {
-            warn("Zero-Touch: Cosmos Connect hook failed:", e.message);
-        }
-
-        return false;
-    }
-
-    // ─── Core: Early Skip ────────────────────────────────────────────
-    //
-    // THE KEY INSIGHT:
-    //   Apple Music's crossfade is done at the AUDIO ENGINE level,
-    //   not by ramping volume up/down in JavaScript.
-    //
-    //   Spotify ALSO has this capability (Settings > Playback > Crossfade).
-    //   When crossfade is enabled, calling Player.next() triggers
-    //   Spotify's native audio mixing — both songs overlap seamlessly.
-    //
-    //   Our job is simply to call next() EARLY — X seconds before the
-    //   current song ends. Spotify handles the rest.
-    //
-    //   Timeline:
-    //   ┌──── Song A ────────────────────────────┐
-    //   │                          ↓ next()       │
-    //   │                   earlyStart sec before  │ natural end
-    //   │                   Spotify crossfades     │
-    //   └──────────────────────┬──────────────────┘
-    //                          │
-    //   ┌──────────────────────┴──── Song B ──────────────────────┐
-    //   │  (starts with Spotify's native crossfade overlap)       │
-    //   └────────────────────────────────────────────────────────┘
-    //
-    function triggerEarlySkip() {
-        if (hasSkipped) return;
-
-        const currentUri = Spicetify.Player?.data?.item?.uri || "";
-        if (currentUri === lastSkippedUri) return; // Already skipped this song
-
-        hasSkipped = true;
-        lastSkippedUri = currentUri;
-
-        const actualRemaining = Spicetify.Player.getDuration() - Spicetify.Player.getProgress();
-        log(`⏭️ EARLY SKIP! Song still has ${(actualRemaining / 1000).toFixed(1)}s remaining. Spotify crossfade handles the mix.`);
-
-        Spicetify.showNotification("🎵 Glide → next track");
-
-        try {
-            // Just-In-Time Guardian: Ensure Spotify's native crossfade is ON right before we skip.
-            // Even if the user turned it off 10 minutes ago in settings, this forces it back on
-            // invisibly to mix this specific transition perfectly.
-            enforceCrossfade();
-
-            // Wait a tiny moment for Cosmos/Prefs to sync state before skipping
-            setTimeout(() => {
-                Spicetify.Player.next();
-            }, 50);
-        } catch (e) {
-            err("Player.next() failed:", e);
-            hasSkipped = false;
-            lastSkippedUri = null;
-        }
-    }
-
-    // ─── Progress Monitor ────────────────────────────────────────────
-    function checkProgress() {
-        if (!isEnabled) return;
-        if (!Spicetify.Player.isPlaying()) return;
-        if (hasSkipped) return;
-
-        let progress, duration;
-        try {
-            progress = Spicetify.Player.getProgress();
-            duration = Spicetify.Player.getDuration();
-        } catch (e) {
+    const checkProgress = async () => {
+        if (!enabled || !Spicetify.Player.isPlaying()) return;
+        const item = normalizedItem();
+        if (!item?.uri) return;
+        const progressMs = Spicetify.Player.getProgress();
+        const progressAt = performance.now();
+        if (
+            controller.state() === "fallback" &&
+            lastProgressAt > 0 &&
+            GlideCore.isProgressDiscontinuity(
+                lastProgress,
+                progressMs,
+                progressAt - lastProgressAt,
+            )
+        ) {
+            automaticTrackUri = null;
+            await controller.cancel("seek");
+            lastProgress = progressMs;
+            lastProgressAt = progressAt;
             return;
         }
+        lastProgress = progressMs;
+        lastProgressAt = progressAt;
+        if (automaticTrackUri === item.uri) return;
+        const started = GlideCore.maybeStartAutomatic({
+            enabled,
+            nativeAutomatic: capabilities.automatic,
+            item,
+            nextItem: Spicetify.Queue?.nextTracks?.[0] ?? null,
+            durationMs: durationSec * 1000,
+            progressMs,
+            totalMs: Spicetify.Player.getDuration(),
+            startFallback: (reason) => controller.beginFallback(reason),
+        });
+        if (started) automaticTrackUri = item.uri;
+    };
 
-        if (!duration || duration <= 0) return;
-        if (progress < 3000) return; // Skip check if we're in the first 3 seconds
-
-        const remaining = duration - progress;
-        if (remaining <= 0) return;
-
-        const earlyMs = earlyStartSec * 1000;
-
-        // Don't trigger for very short tracks (shorter than 2x earlyStart)
-        if (duration < earlyMs * 2) return;
-
-        if (remaining <= earlyMs) {
-            // v3.2: Smart Album Gapless Bypass
-            if (smartGapless && Spicetify.Queue?.nextTracks?.length > 0) {
-                const currentTrackUri = Spicetify.Player.data?.item?.uri;
-                const nextTrackUri = Spicetify.Queue.nextTracks[0]?.uri;
-                const currentAlbumUri = Spicetify.Player.data?.item?.album?.uri;
-                const nextAlbumUri = Spicetify.Queue.nextTracks[0]?.contextTrack?.metadata?.album_uri;
-
-                // Ensure it's not a single track on loop (Repeat One) before applying the album bypass
-                const isRepeatOne = Spicetify.Player.getRepeat() === 2;
-
-                if (!isRepeatOne && currentAlbumUri && nextAlbumUri && currentAlbumUri === nextAlbumUri) {
-                    // Suppress early skip! Native gapless will handle the transition.
-                    log(`📦 Smart Album Gapless: Suppressing early skip for identical album URIs (${currentAlbumUri}).`);
-                    hasSkipped = true; // Mark as skipped so we don't keep logging this thousands of times
-                    lastSkippedUri = currentTrackUri || "unknown";
-                    return;
-                }
-            }
-
-            log(`⏱ Trigger! remaining=${(remaining / 1000).toFixed(1)}s ≤ earlyStart=${earlyStartSec}s`);
-            triggerEarlySkip();
+    const requestManualNext = async () => {
+        if (!enabled) return rawNext();
+        if (controller.state() === "fallback") {
+            return controller.cancel("repeated-next", { advance: true });
         }
-    }
+        return GlideCore.requestNext({
+            nativeManual: capabilities.manual,
+            crossfadeToNext: () => Spicetify.Platform.PlayerAPI.crossfadeToNext(durationSec),
+            startFallback: (reason) => controller.startFallback(reason),
+        });
+    };
 
-    // Dual monitoring: onprogress events + heartbeat backup
-    function onProgressChange() {
-        checkProgress();
-    }
+    const updateControls = () => {
+        if (playbarButton) {
+            playbarButton.active = enabled;
+            playbarButton.label = enabled ? "Glide: ON" : "Glide: OFF";
+        }
+        if (menuItem) menuItem.isEnabled = enabled;
+    };
 
-    let heartbeatId = null;
-    function startHeartbeat() {
-        if (heartbeatId) return;
-        heartbeatId = setInterval(checkProgress, HEARTBEAT_MS);
-        log("Heartbeat started (" + HEARTBEAT_MS + "ms)");
-    }
-
-    // ─── Song Change Handler ─────────────────────────────────────────
-    function onSongChange() {
-        // Reset skip state for the new song
-        hasSkipped = false;
-        log("Song changed — ready for next glide");
-    }
-
-    // ─── Settings UI — Minimal ─────────────────────────────────────────
-    function openSettingsModal() {
+    const openSettingsModal = () => {
         const container = document.createElement("div");
         container.innerHTML = `
             <style>
-                .g{padding:8px 0 4px;font-family:var(--font-family,'CircularSp',sans-serif);color:var(--spice-text,#fff)}
-                .g__row{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
-                .g__lbl{font-size:14px;font-weight:700}
-                .g__val{font-size:14px;font-weight:700;color:#1DB954;min-width:28px;text-align:right}
-                .g__sub{font-size:11px;color:var(--spice-subtext,#b3b3b3);margin-bottom:14px}
-                .g__sl{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:2px;background:var(--spice-button-disabled,#535353);outline:none;cursor:pointer;margin:10px 0 6px}
-                .g__sl::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:14px;height:14px;border-radius:50%;background:#1DB954;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.4);transition:transform .15s}
-                .g__sl::-webkit-slider-thumb:hover{transform:scale(1.25)}
-                .g__ticks{display:flex;justify-content:space-between;margin-bottom:20px}
-                .g__tick{font-size:10px;color:var(--spice-subtext,#b3b3b3);opacity:.5}
-                .g__div{height:1px;background:rgba(255,255,255,.08);margin:4px 0 14px}
-                .g__tgl{position:relative;width:38px;height:20px;background:var(--spice-button-disabled,#535353);border-radius:10px;border:none;cursor:pointer;transition:background .2s;padding:0;flex-shrink:0}
-                .g__tgl.on{background:#1DB954}
-                .g__tgl::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
-                .g__tgl.on::after{transform:translateX(18px)}
-                .g__foot{font-size:11px;color:var(--spice-subtext,#b3b3b3);opacity:.4;text-align:center;margin-top:18px}
+                .g{width:390px;max-width:calc(100vw - 48px);padding:12px 4px 4px;color:var(--spice-text,#fff)}
+                .g__row{display:flex;align-items:center;justify-content:space-between;margin:8px 0}
+                .g__label{font-size:22px;font-weight:700}
+                .g__value{font-size:22px;font-weight:700;color:#1ed760}
+                .g__range{appearance:none;width:100%;height:6px;border-radius:6px;background:#3e3e3e;margin:20px 0 8px}
+                .g__range::-webkit-slider-thumb{appearance:none;width:24px;height:24px;border-radius:50%;background:#1ed760;cursor:pointer}
+                .g__ticks{display:flex;justify-content:space-between;color:var(--spice-subtext,#b3b3b3);font-size:13px}
+                .g__helper{text-align:center;color:var(--spice-subtext,#b3b3b3);font-size:15px;margin:18px 0 8px}
+                .g__status{text-align:center;color:#1ed760;font-size:12px;margin:0 0 18px}
+                .g__divider{height:1px;background:rgba(255,255,255,.12);margin:0 0 18px}
+                .g__toggle{position:relative;width:52px;height:28px;border:0;border-radius:20px;background:#535353;cursor:pointer}
+                .g__toggle.on{background:#1ed760}
+                .g__toggle::after{content:'';position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;transition:transform .2s}
+                .g__toggle.on::after{transform:translateX(24px)}
+                .g__footer{text-align:center;color:var(--spice-subtext,#b3b3b3);opacity:.45;font-size:11px;margin-top:22px}
             </style>
             <div class="g">
-                <div class="g__row">
-                    <span class="g__lbl">Glide</span>
-                    <span class="g__val" id="g-val">${earlyStartSec}s</span>
-                </div>
-                <input type="range" class="g__sl" id="g-sl"
-                    min="${MIN_EARLY}" max="${MAX_EARLY}" step="0.5" value="${earlyStartSec}"/>
-                <div class="g__ticks">
-                    <span class="g__tick">1s</span><span class="g__tick">5s</span>
-                    <span class="g__tick">10s</span><span class="g__tick">15s</span>
-                </div>
-                <p class="g__sub">Seamless transition timing</p>
-                <div class="g__div"></div>
-                
-                <div class="g__row" style="margin-bottom: 2px;">
-                    <span class="g__lbl">Smart Gapless (Albums)</span>
-                    <button class="g__tgl ${smartGapless ? "on" : ""}" id="g-gapless-tgl"></button>
-                </div>
-                <p class="g__sub" style="margin-bottom: 12px; margin-top: 0;">Preserve gapless playback for consecutive album tracks.</p>
-
-                <div class="g__row" style="margin-top: 6px;">
-                    <span class="g__lbl">Enable Glide</span>
-                    <button class="g__tgl ${isEnabled ? "on" : ""}" id="g-toggle"></button>
-                </div>
-                <div class="g__foot">Glide v3.2.0</div>
+                ${GlideCore.renderSettingsMarkup({
+                    enabled,
+                    durationSec,
+                    status: statusCopy(),
+                })}
+                <div class="g__footer">Glide v4.0.0</div>
             </div>`;
 
-        const sl = container.querySelector("#g-sl");
-        const val = container.querySelector("#g-val");
-        sl.addEventListener("input", () => {
-            const v = parseFloat(sl.value);
-            val.textContent = `${v}s`;
-            earlyStartSec = v;
-            crossfadeSec = v;   // keep crossfade in sync with the single slider
+        const range = container.querySelector("#g-range");
+        const value = container.querySelector("#g-value");
+        const status = container.querySelector("#g-status");
+        range.addEventListener("input", async () => {
+            durationSec = GlideCore.clampDuration(range.value);
+            value.textContent = `${durationSec}s`;
             saveSettings();
-            enforceCrossfade(); // silently sync Spotify's crossfade duration
-        });
-
-        const gapTgl = container.querySelector("#g-gapless-tgl");
-        gapTgl.addEventListener("click", () => {
-            smartGapless = !smartGapless;
-            gapTgl.classList.toggle("on", smartGapless);
-            saveSettings();
+            status.textContent = "Checking Spotify…";
+            await probeCapability();
+            status.textContent = statusCopy();
         });
 
         const toggle = container.querySelector("#g-toggle");
-        toggle.addEventListener("click", () => {
-            isEnabled = !isEnabled;
-            toggle.classList.toggle("on", isEnabled);
+        toggle.addEventListener("click", async () => {
+            enabled = !enabled;
+            toggle.classList.toggle("on", enabled);
+            toggle.setAttribute("aria-checked", String(enabled));
+            if (!enabled) await controller.cancel("disabled");
             saveSettings();
-            updatePlaybarButton();
-            updateMenuState();
-            Spicetify.showNotification(
-                isEnabled ? "✨ Glide enabled" : "Glide disabled",
-                !isEnabled
-            );
+            updateControls();
+            Spicetify.showNotification(enabled ? "Glide enabled" : "Glide disabled");
         });
 
-        Spicetify.PopupModal.display({
-            title: "⚡ Glide",
-            content: container,
-        });
+        Spicetify.PopupModal.display({ title: "⚡ Glide", content: container });
+    };
+
+    playbarButton = new Spicetify.Playbar.Button(
+        enabled ? "Glide: ON" : "Glide: OFF",
+        ICON,
+        openSettingsModal,
+        false,
+        enabled,
+    );
+
+    if (Spicetify.Menu?.Item) {
+        menuItem = new Spicetify.Menu.Item(
+            "Enable Glide",
+            enabled,
+            async () => {
+                enabled = !enabled;
+                if (!enabled) await controller.cancel("disabled");
+                saveSettings();
+                updateControls();
+            },
+            ICON,
+        );
+        menuItem.register();
     }
 
-    // ─── Test Skip ───────────────────────────────────────────────────
-    function testSkip() {
+    const restoreNext = GlideCore.installNextInterceptor(
+        Spicetify.Player,
+        requestManualNext,
+    );
+    if (!restoreNext) warn("Player.next interception is unavailable");
+
+    document.addEventListener("click", (event) => {
+        const nextButton = event.target?.closest?.(
+            '[data-testid="control-button-skip-forward"]',
+        );
+        if (!nextButton || !enabled) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        requestManualNext().catch((nextError) => error("Visible Next failed:", nextError));
+    }, true);
+
+    Spicetify.Player.addEventListener("onprogress", () => {
+        checkProgress().catch((progressError) => error("Progress check failed:", progressError));
+    });
+    Spicetify.Player.addEventListener("songchange", () => {
+        automaticTrackUri = null;
+        lastProgress = 0;
+        lastProgressAt = 0;
+        if (controller.expectsSongChange()) {
+            const waiters = songChangeWaiters;
+            songChangeWaiters = [];
+            const actualUri = Spicetify.Player.data?.item?.uri || null;
+            waiters.forEach((waiter) => waiter.resolve(
+                GlideCore.isExpectedTrackChange(
+                    waiter.sourceUri,
+                    waiter.expectedUri,
+                    actualUri,
+                ),
+            ));
+        } else if (controller.state() === "fallback") {
+            controller.cancel("unrelated-songchange")
+                .catch((cancelError) => error("Song-change cancel failed:", cancelError));
+        }
+    });
+    Spicetify.Player.addEventListener("onplaypause", () => {
         if (!Spicetify.Player.isPlaying()) {
-            Spicetify.showNotification("▶️ Play a song first", true);
-            return;
+            controller.cancel("pause").catch((cancelError) => error("Cancel failed:", cancelError));
         }
-        Spicetify.showNotification("🧪 Testing early skip...");
-        log("Manual test triggered");
-        hasSkipped = false;
-        lastSkippedUri = null;
-        triggerEarlySkip();
-    }
-
-    // ─── Playbar Button ──────────────────────────────────────────────
-    let playbarBtn = null;
-
-    function updatePlaybarButton() {
-        if (!playbarBtn) return;
-        try {
-            playbarBtn.active = isEnabled;
-            playbarBtn.icon = isEnabled ? ICON_ON : ICON_OFF;
-            playbarBtn.label = isEnabled ? "Glide: ON" : "Glide: OFF";
-        } catch (e) { err("Playbar update failed:", e); }
-    }
-
-    function initPlaybarButton() {
-        try {
-            playbarBtn = new Spicetify.Playbar.Button(
-                isEnabled ? "Glide: ON" : "Glide: OFF",
-                isEnabled ? ICON_ON : ICON_OFF,
-                () => openSettingsModal(),
-                false, isEnabled, true
-            );
-            log("Playbar button ready");
-        } catch (e) { err("Playbar init failed:", e); }
-    }
-
-    // ─── Profile Menu ────────────────────────────────────────────────
-    let menuItem = null;
-
-    function updateMenuState() {
-        if (!menuItem) return;
-        try {
-            menuItem.setState(isEnabled);
-            menuItem.setName(isEnabled ? "Glide: ON ✨" : "Glide: OFF");
-        } catch (e) { err("Menu update failed:", e); }
-    }
-
-    function initMenu() {
-        try {
-            menuItem = new Spicetify.Menu.Item(
-                isEnabled ? "Glide: ON ✨" : "Glide: OFF",
-                isEnabled,
-                () => {
-                    isEnabled = !isEnabled;
-                    saveSettings();
-                    updatePlaybarButton();
-                    updateMenuState();
-                    Spicetify.showNotification(
-                        isEnabled ? "✨ Glide enabled" : "Glide disabled",
-                        !isEnabled
-                    );
-                },
-                "enhance"
-            );
-            menuItem.register();
-            log("Menu ready");
-        } catch (e) { err("Menu init failed:", e); }
-    }
-
-    // ─── Auto-Update Notification System ─────────────────────────────
-    // Checks the raw GitHub manifest.json to see if a newer version is available.
-    async function checkForUpdates() {
-        try {
-            const currentVersion = "3.2.0";
-            const manifestUrl = "https://raw.githubusercontent.com/janakchoudharydev/spicetify-glide/main/manifest.json";
-
-            const response = await fetch(manifestUrl, { cache: "no-store" });
-            if (!response.ok) return;
-
-            const manifest = await response.json();
-            const remoteVersion = manifest.version;
-
-            if (!remoteVersion) return;
-
-            // Simple semantic version check (assumes X.Y.Z format)
-            const isNewer = (local, remote) => {
-                const lParts = local.split('.').map(Number);
-                const rParts = remote.split('.').map(Number);
-                for (let i = 0; i < Math.max(lParts.length, rParts.length); i++) {
-                    const l = lParts[i] || 0;
-                    const r = rParts[i] || 0;
-                    if (r > l) return true;
-                    if (r < l) return false;
-                }
-                return false;
-            };
-
-            if (isNewer(currentVersion, remoteVersion)) {
-                // Check if user already dismissed this specific version
-                const dismissedVersion = Spicetify.LocalStorage.get("glide:dismissed_version");
-                if (dismissedVersion === remoteVersion) {
-                    log(`Update to ${remoteVersion} available, but was previously dismissed.`);
-                    return;
-                }
-
-                log(`Update available! Current: ${currentVersion}, Remote: ${remoteVersion}`);
-
-                // Build the PopupModal DOM
-                const container = document.createElement("div");
-                container.innerHTML = `
-                    <style>
-                        .g-upd-container {
-                            display: flex;
-                            flex-direction: column;
-                            gap: 16px;
-                            color: var(--spice-text);
-                        }
-                        .g-upd-text {
-                            font-size: 14px;
-                            line-height: 1.5;
-                        }
-                        .g-upd-buttons {
-                            display: flex;
-                            justify-content: flex-end;
-                            gap: 12px;
-                            margin-top: 8px;
-                        }
-                        .g-upd-btn {
-                            padding: 8px 16px;
-                            border-radius: 4px;
-                            border: none;
-                            font-weight: bold;
-                            cursor: pointer;
-                            font-size: 14px;
-                        }
-                        .g-upd-btn-primary {
-                            background-color: var(--spice-button);
-                            color: var(--spice-button-active);
-                        }
-                        .g-upd-btn-primary:hover {
-                            background-color: var(--spice-button-active);
-                            color: var(--spice-main);
-                        }
-                        .g-upd-btn-secondary {
-                            background-color: transparent;
-                            color: var(--spice-subtext);
-                        }
-                        .g-upd-btn-secondary:hover {
-                            color: var(--spice-text);
-                        }
-                    </style>
-                    <div class="g-upd-container">
-                        <div class="g-upd-text">
-                            A new version of Glide is available! You're currently running <b>v${currentVersion}</b>, and the latest version is <b>v${remoteVersion}</b>.
-                            <br><br>
-                            If you installed via the Spicetify Marketplace, it will update automatically soon. Otherwise, you can manually pull from GitHub.
-                        </div>
-                        <div class="g-upd-buttons">
-                            <button class="g-upd-btn g-upd-btn-secondary" id="g-upd-skip">Skip this version</button>
-                            <button class="g-upd-btn g-upd-btn-secondary" id="g-upd-later">Remind me later</button>
-                            <button class="g-upd-btn g-upd-btn-primary" id="g-upd-now">Open GitHub</button>
-                        </div>
-                    </div>
-                `;
-
-                container.querySelector("#g-upd-now").addEventListener("click", () => {
-                    window.open("https://github.com/janakchoudharydev/spicetify-glide", "_blank");
-                    Spicetify.PopupModal.hide();
-                });
-
-                container.querySelector("#g-upd-later").addEventListener("click", () => {
-                    Spicetify.PopupModal.hide();
-                });
-
-                container.querySelector("#g-upd-skip").addEventListener("click", () => {
-                    Spicetify.LocalStorage.set("glide:dismissed_version", remoteVersion);
-                    Spicetify.PopupModal.hide();
-                });
-
-                Spicetify.PopupModal.display({
-                    title: "🚀 New Glide Version Available!",
-                    content: container,
-                });
-            }
-        } catch (e) {
-            warn("Failed to check for updates:", e.message);
-        }
-    }
-
-    // ─── Initialize ──────────────────────────────────────────────────
-    loadSettings();
-    initPlaybarButton();
-    initMenu();
-
-    // Try to enable Spotify's native crossfade
-    enforceCrossfade();
-
-    // Register event listeners
-    Spicetify.Player.addEventListener("onprogress", onProgressChange);
-    Spicetify.Player.addEventListener("songchange", onSongChange);
-
-    // Start heartbeat backup
-    startHeartbeat();
-
-    if (isEnabled) {
-        Spicetify.showNotification("✨ Glide v3.2.0 — Smart Album transitions active");
-    }
-
-    log("v3.2.0 loaded!", {
-        enabled: isEnabled,
-        earlyStart: earlyStartSec + "s",
-        crossfade: crossfadeSec + "s",
-        smartGapless: smartGapless,
-        spotifyCrossfade: spotifyCrossfadeStatus,
     });
 
-    // Check for updates in the background
-    checkForUpdates();
+    const handleDeviceChange = async () => {
+        await controller.cancel("device-change");
+        automaticTrackUri = null;
+        lastProgress = 0;
+        lastProgressAt = 0;
+        await probeCapability();
+    };
+    try {
+        Spicetify.Player.addEventListener("devicechange", () => {
+            handleDeviceChange().catch((deviceError) => error("Device change failed:", deviceError));
+        });
+        Spicetify.Platform.PlayerAPI?.addEventListener?.("devicechange", () => {
+            handleDeviceChange().catch((deviceError) => error("Device change failed:", deviceError));
+        });
+    } catch (deviceListenerError) {
+        warn("Device-change events are unavailable:", deviceListenerError);
+    }
+
+    setInterval(() => {
+        checkProgress().catch((progressError) => error("Heartbeat failed:", progressError));
+    }, 400);
+
+    await probeCapability();
+    updateControls();
+    if (enabled) Spicetify.showNotification(`Glide 4.0 · ${statusCopy()}`);
+    log("v4.0.0 loaded", { enabled, durationSec, capabilities });
 })();
+}
