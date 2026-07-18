@@ -31,30 +31,79 @@ const GlideCore = (() => {
             automatic: false,
             manual: typeof platform?.PlayerAPI?.crossfadeToNext === "function",
         };
+        const unwrap = (setting) => {
+            if (setting && typeof setting === "object") {
+                for (const key of ["value", "boolValue", "numberValue"]) {
+                    if (key in setting) return unwrap(setting[key]);
+                }
+            }
+            return setting;
+        };
         const config = platform?.ConfigAPI;
+        const durationMs = clampDuration(durationSec) * 1000;
+
         if (
-            typeof config?.setAccountSetting !== "function" ||
-            typeof config?.getAccountSetting !== "function"
+            typeof config?.setAccountSetting === "function" &&
+            typeof config?.getAccountSetting === "function"
         ) {
-            return result;
+            try {
+                await config.setAccountSetting("audio.crossfade_v2", true);
+                await config.setAccountSetting("audio.crossfade.time_v2", durationMs);
+                const enabled = unwrap(await config.getAccountSetting("audio.crossfade_v2"));
+                const configuredDuration = unwrap(
+                    await config.getAccountSetting("audio.crossfade.time_v2"),
+                );
+                result.automatic = enabled === true && Number(configuredDuration) === durationMs;
+            } catch (error) {
+                logger?.warn?.("[Glide] ConfigAPI crossfade probe failed", error);
+            }
+            if (result.automatic) return result;
         }
 
-        const durationMs = clampDuration(durationSec) * 1000;
-        try {
-            await config.setAccountSetting("audio.crossfade_v2", true);
-            await config.setAccountSetting("audio.crossfade.time_v2", durationMs);
-            const enabled = await config.getAccountSetting("audio.crossfade_v2");
-            const configuredDuration = await config.getAccountSetting("audio.crossfade.time_v2");
-            result.automatic = enabled === true && Number(configuredDuration) === durationMs;
-        } catch (error) {
-            logger?.warn?.("[Glide] Native crossfade probe failed", error);
+        const preferences = platform?.PlayerAPI?._prefs;
+        if (
+            typeof preferences?.setCrossfade === "function" &&
+            typeof preferences?.getCrossfade === "function"
+        ) {
+            try {
+                await preferences.setCrossfade(true, clampDuration(durationSec));
+                const configured = await preferences.getCrossfade();
+                const enabled = unwrap(configured?.enabled ?? configured?.isEnabled);
+                const duration = unwrap(
+                    configured?.duration ?? configured?.durationSec ?? configured?.duration_ms,
+                );
+                result.automatic = enabled === true &&
+                    (Number(duration) === clampDuration(durationSec) ||
+                        Number(duration) === durationMs);
+            } catch (error) {
+                logger?.warn?.("[Glide] Player preferences crossfade probe failed", error);
+            }
         }
+
         return result;
+    };
+
+    const createLatestProbe = (probe, publish) => {
+        let generation = 0;
+        return async (...args) => {
+            const current = ++generation;
+            const result = await probe(...args);
+            if (current === generation) publish(result);
+            return result;
+        };
     };
 
     const createTransitionController = (deps) => {
         let token = 0;
         let active = null;
+        const reportError = (error) => deps.onError?.(error);
+        const restoreVolume = (transition) => {
+            try {
+                deps.setVolume(transition.volume);
+            } catch (error) {
+                reportError(error);
+            }
+        };
 
         const animate = (transition, durationMs, gain) => new Promise((resolve) => {
             const startedAt = deps.now();
@@ -84,8 +133,10 @@ const GlideCore = (() => {
             }
             token += 1;
             active = null;
-            deps.setVolume(transition.volume);
-            transition.settle?.();
+            const settle = transition.settle;
+            transition.settle = null;
+            restoreVolume(transition);
+            settle?.();
             if (options.advance) await deps.next();
         };
 
@@ -95,22 +146,29 @@ const GlideCore = (() => {
                 token: ++token,
                 volume: deps.getVolume(),
                 settle: null,
+                phase: "fade-out",
             };
             active = transition;
-            const halfDuration = Math.max(1, deps.durationMs() / 2);
+            const totalDuration = Math.max(2, deps.durationMs());
+            const startedAt = deps.now();
+            const halfDuration = totalDuration / 2;
             try {
                 await animate(transition, halfDuration, fadeOutGain);
                 if (transition.token !== token) return;
+                transition.phase = "awaiting-change";
                 const songChanged = deps.waitForSongChange();
                 await deps.next();
                 if (transition.token !== token) return;
-                await songChanged;
+                const confirmed = await songChanged;
                 if (transition.token !== token) return;
-                await animate(transition, halfDuration, fadeInGain);
+                if (confirmed === false) return;
+                transition.phase = "fade-in";
+                const remainingDuration = Math.max(1, totalDuration - (deps.now() - startedAt));
+                await animate(transition, remainingDuration, fadeInGain);
             } finally {
                 if (transition.token === token) {
-                    deps.setVolume(transition.volume);
                     active = null;
+                    restoreVolume(transition);
                 }
             }
         };
@@ -119,6 +177,7 @@ const GlideCore = (() => {
             startFallback,
             cancel,
             state: () => active ? "fallback" : "idle",
+            expectsSongChange: () => active?.phase === "awaiting-change",
         };
     };
 
@@ -154,6 +213,34 @@ const GlideCore = (() => {
         return "fallback";
     };
 
+    const isProgressDiscontinuity = (
+        previousProgress,
+        currentProgress,
+        elapsedMs,
+        toleranceMs = 1500,
+    ) => {
+        if (![previousProgress, currentProgress, elapsedMs].every(Number.isFinite)) return false;
+        return Math.abs((currentProgress - previousProgress) - elapsedMs) > toleranceMs;
+    };
+
+    const installNextInterceptor = (player, replacement) => {
+        const original = player.next;
+        try {
+            player.next = replacement;
+        } catch (_error) {
+            return null;
+        }
+        if (player.next !== replacement) return null;
+        return () => {
+            if (player.next === replacement) player.next = original;
+        };
+    };
+
+    const isExpectedTrackChange = (sourceUri, expectedUri, actualUri) => {
+        if (!actualUri || actualUri === sourceUri) return false;
+        return expectedUri ? actualUri === expectedUri : true;
+    };
+
     const renderSettingsMarkup = ({ enabled, durationSec, status }) => `
         <div class="g__row">
             <span class="g__label">Glide</span>
@@ -178,10 +265,14 @@ const GlideCore = (() => {
         fadeInGain,
         loadSettings,
         probeNativeCapability,
+        createLatestProbe,
         createTransitionController,
         isFallbackEligible,
         maybeStartAutomatic,
         requestNext,
+        isProgressDiscontinuity,
+        installNextInterceptor,
+        isExpectedTrackChange,
         renderSettingsMarkup,
     };
 })();
@@ -224,6 +315,7 @@ if (typeof Spicetify !== "undefined") {
     let capabilityStatus = "checking";
     let automaticTrackUri = null;
     let lastProgress = 0;
+    let lastProgressAt = 0;
     let songChangeWaiters = [];
     let playbarButton = null;
     let menuItem = null;
@@ -235,15 +327,21 @@ if (typeof Spicetify !== "undefined") {
     };
 
     const waitForSongChange = () => new Promise((resolve) => {
-        const waiter = () => {
-            clearTimeout(timeout);
-            resolve();
+        const entry = {
+            sourceUri: Spicetify.Player.data?.item?.uri || null,
+            expectedUri: Spicetify.Queue?.nextTracks?.[0]?.uri ||
+                Spicetify.Queue?.nextTracks?.[0]?.contextTrack?.uri ||
+                null,
+            resolve: (confirmed) => {
+                clearTimeout(timeout);
+                resolve(confirmed);
+            },
         };
         const timeout = setTimeout(() => {
-            songChangeWaiters = songChangeWaiters.filter((entry) => entry !== waiter);
-            resolve();
+            songChangeWaiters = songChangeWaiters.filter((waiter) => waiter !== entry);
+            resolve(false);
         }, 3000);
-        songChangeWaiters.push(waiter);
+        songChangeWaiters.push(entry);
     });
 
     const controller = GlideCore.createTransitionController({
@@ -262,15 +360,22 @@ if (typeof Spicetify !== "undefined") {
             ? "Native crossfade"
             : "Fallback fade";
 
+    const runCapabilityProbe = GlideCore.createLatestProbe(
+        (seconds) => GlideCore.probeNativeCapability(
+            Spicetify.Platform,
+            seconds,
+            { warn },
+        ),
+        (result) => {
+            capabilities = result;
+            capabilityStatus = result.automatic ? "native" : "fallback";
+            log("Transition capability:", result);
+        },
+    );
+
     const probeCapability = async () => {
         capabilityStatus = "checking";
-        capabilities = await GlideCore.probeNativeCapability(
-            Spicetify.Platform,
-            durationSec,
-            { warn },
-        );
-        capabilityStatus = capabilities.automatic ? "native" : "fallback";
-        log("Transition capability:", capabilities);
+        await runCapabilityProbe(durationSec);
     };
 
     const normalizedItem = () => {
@@ -287,11 +392,24 @@ if (typeof Spicetify !== "undefined") {
         const item = normalizedItem();
         if (!item?.uri || automaticTrackUri === item.uri) return;
         const progressMs = Spicetify.Player.getProgress();
-        if (progressMs + 1500 < lastProgress) {
+        const progressAt = performance.now();
+        if (
+            controller.state() === "fallback" &&
+            lastProgressAt > 0 &&
+            GlideCore.isProgressDiscontinuity(
+                lastProgress,
+                progressMs,
+                progressAt - lastProgressAt,
+            )
+        ) {
             automaticTrackUri = null;
             await controller.cancel("seek");
+            lastProgress = progressMs;
+            lastProgressAt = progressAt;
+            return;
         }
         lastProgress = progressMs;
+        lastProgressAt = progressAt;
         const started = await GlideCore.maybeStartAutomatic({
             enabled,
             nativeAutomatic: capabilities.automatic,
@@ -402,11 +520,21 @@ if (typeof Spicetify !== "undefined") {
         menuItem.register();
     }
 
-    try {
-        Spicetify.Player.next = requestManualNext;
-    } catch (interceptionError) {
-        warn("Manual Next interception is unavailable:", interceptionError);
-    }
+    const restoreNext = GlideCore.installNextInterceptor(
+        Spicetify.Player,
+        requestManualNext,
+    );
+    if (!restoreNext) warn("Player.next interception is unavailable");
+
+    document.addEventListener("click", (event) => {
+        const nextButton = event.target?.closest?.(
+            '[data-testid="control-button-skip-forward"]',
+        );
+        if (!nextButton || !enabled) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        requestManualNext().catch((nextError) => error("Visible Next failed:", nextError));
+    }, true);
 
     Spicetify.Player.addEventListener("onprogress", () => {
         checkProgress().catch((progressError) => error("Progress check failed:", progressError));
@@ -414,15 +542,46 @@ if (typeof Spicetify !== "undefined") {
     Spicetify.Player.addEventListener("songchange", () => {
         automaticTrackUri = null;
         lastProgress = 0;
-        const waiters = songChangeWaiters;
-        songChangeWaiters = [];
-        waiters.forEach((resolve) => resolve());
+        lastProgressAt = 0;
+        if (controller.expectsSongChange()) {
+            const waiters = songChangeWaiters;
+            songChangeWaiters = [];
+            const actualUri = Spicetify.Player.data?.item?.uri || null;
+            waiters.forEach((waiter) => waiter.resolve(
+                GlideCore.isExpectedTrackChange(
+                    waiter.sourceUri,
+                    waiter.expectedUri,
+                    actualUri,
+                ),
+            ));
+        } else if (controller.state() === "fallback") {
+            controller.cancel("unrelated-songchange")
+                .catch((cancelError) => error("Song-change cancel failed:", cancelError));
+        }
     });
     Spicetify.Player.addEventListener("onplaypause", () => {
         if (!Spicetify.Player.isPlaying()) {
             controller.cancel("pause").catch((cancelError) => error("Cancel failed:", cancelError));
         }
     });
+
+    const handleDeviceChange = async () => {
+        await controller.cancel("device-change");
+        automaticTrackUri = null;
+        lastProgress = 0;
+        lastProgressAt = 0;
+        await probeCapability();
+    };
+    try {
+        Spicetify.Player.addEventListener("devicechange", () => {
+            handleDeviceChange().catch((deviceError) => error("Device change failed:", deviceError));
+        });
+        Spicetify.Platform.PlayerAPI?.addEventListener?.("devicechange", () => {
+            handleDeviceChange().catch((deviceError) => error("Device change failed:", deviceError));
+        });
+    } catch (deviceListenerError) {
+        warn("Device-change events are unavailable:", deviceListenerError);
+    }
 
     setInterval(() => {
         checkProgress().catch((progressError) => error("Heartbeat failed:", progressError));

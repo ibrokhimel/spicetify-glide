@@ -87,6 +87,58 @@ test("does not trust native setters without a read path", async () => {
     );
 });
 
+test("normalizes wrapped ConfigAPI setting values", async () => {
+    const values = new Map();
+    const platform = {
+        ConfigAPI: {
+            setAccountSetting: async (key, value) => values.set(key, value),
+            getAccountSetting: async (key) => ({ value: values.get(key) }),
+        },
+    };
+    assert.deepEqual(
+        await GlideCore.probeNativeCapability(platform, 4),
+        { automatic: true, manual: false },
+    );
+});
+
+test("falls through to an isolated player preferences adapter", async () => {
+    let configured = null;
+    const platform = {
+        ConfigAPI: {
+            async setAccountSetting() { throw new Error("unsupported"); },
+            async getAccountSetting() { throw new Error("unsupported"); },
+        },
+        PlayerAPI: {
+            _prefs: {
+                setCrossfade: (enabled, duration) => { configured = { enabled, duration }; },
+                getCrossfade: () => configured,
+            },
+        },
+    };
+    assert.deepEqual(
+        await GlideCore.probeNativeCapability(platform, 6, { warn() {} }),
+        { automatic: true, manual: false },
+    );
+});
+
+test("latest capability probe ignores stale completions", async () => {
+    const pending = new Map();
+    const published = [];
+    const runProbe = GlideCore.createLatestProbe(
+        (value) => new Promise((resolve) => pending.set(value, resolve)),
+        (result) => published.push(result),
+    );
+
+    const first = runProbe("first");
+    const second = runProbe("second");
+    pending.get("second")({ automatic: true });
+    await second;
+    pending.get("first")({ automatic: false });
+    await first;
+
+    assert.deepEqual(published, [{ automatic: true }]);
+});
+
 test("fallback fades out, advances once, and fades in to the captured volume", async () => {
     let time = 0;
     let advances = 0;
@@ -131,6 +183,67 @@ test("cancelling fallback restores volume and prevents an advance", async () => 
 
     assert.equal(controller.state(), "idle");
     assert.equal(volumes.at(-1), 0.6);
+});
+
+test("controller reports whether the next song change is expected", async () => {
+    const frames = [];
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => 0,
+        requestFrame: (callback) => frames.push(callback),
+        getVolume: () => 0.6,
+        setVolume() {},
+        next: async () => {},
+        waitForSongChange: async () => true,
+    });
+
+    const transition = controller.startFallback("automatic");
+    assert.equal(controller.expectsSongChange(), false);
+    await controller.cancel("unrelated-songchange");
+    await transition;
+});
+
+test("fallback restores volume and stops when song confirmation times out", async () => {
+    let time = 0;
+    let advances = 0;
+    const volumes = [];
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => time,
+        requestFrame: (callback) => {
+            time += 500;
+            queueMicrotask(callback);
+        },
+        getVolume: () => 0.6,
+        setVolume: (volume) => volumes.push(volume),
+        next: async () => { advances += 1; },
+        waitForSongChange: async () => false,
+    });
+
+    await controller.startFallback("automatic");
+    assert.equal(advances, 1);
+    assert.equal(volumes.length, 2);
+    assert.equal(volumes.at(-1), 0.6);
+    assert.equal(controller.state(), "idle");
+});
+
+test("cancel settles even when restoring volume throws", async () => {
+    const frames = [];
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => 0,
+        requestFrame: (callback) => frames.push(callback),
+        getVolume: () => 0.6,
+        setVolume: () => { throw new Error("device gone"); },
+        next: async () => {},
+        waitForSongChange: async () => true,
+        onError() {},
+    });
+
+    const transition = controller.startFallback("automatic");
+    await controller.cancel("device-change");
+    await transition;
+    assert.equal(controller.state(), "idle");
 });
 
 test("a repeated Next cancels fallback and advances exactly once", async () => {
@@ -253,6 +366,45 @@ test("manual Next uses only an explicitly verified native transition", async () 
     });
     assert.equal(nativeCalls, 1);
     assert.equal(fallbackCalls, 1);
+});
+
+test("detects forward and backward seek discontinuities", () => {
+    assert.equal(GlideCore.isProgressDiscontinuity(10000, 11000, 1000), false);
+    assert.equal(GlideCore.isProgressDiscontinuity(10000, 30000, 1000), true);
+    assert.equal(GlideCore.isProgressDiscontinuity(10000, 2000, 1000), true);
+});
+
+test("Next interception verifies assignment and can be restored", () => {
+    const original = () => "original";
+    const replacement = () => "replacement";
+    const player = { next: original };
+    const restore = GlideCore.installNextInterceptor(player, replacement);
+    assert.equal(player.next, replacement);
+    restore();
+    assert.equal(player.next, original);
+
+    const locked = {};
+    Object.defineProperty(locked, "next", { value: original, writable: false });
+    assert.equal(GlideCore.installNextInterceptor(locked, replacement), null);
+});
+
+test("song-change confirmation rejects an unrelated target", () => {
+    assert.equal(
+        GlideCore.isExpectedTrackChange("spotify:track:a", "spotify:track:b", "spotify:track:b"),
+        true,
+    );
+    assert.equal(
+        GlideCore.isExpectedTrackChange("spotify:track:a", "spotify:track:b", "spotify:track:c"),
+        false,
+    );
+    assert.equal(
+        GlideCore.isExpectedTrackChange("spotify:track:a", null, "spotify:track:c"),
+        true,
+    );
+    assert.equal(
+        GlideCore.isExpectedTrackChange("spotify:track:a", null, "spotify:track:a"),
+        false,
+    );
 });
 
 test("settings markup exposes the approved controls and status", () => {
