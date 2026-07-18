@@ -174,3 +174,83 @@ test("fallback restores volume when advancing fails", async () => {
     assert.equal(volumes.at(-1), 0.4);
     assert.equal(controller.state(), "idle");
 });
+
+test("fallback subscribes to song change before advancing", async () => {
+    let time = 0;
+    let subscribed = false;
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => time,
+        requestFrame: (callback) => {
+            time += 500;
+            queueMicrotask(callback);
+        },
+        getVolume: () => 0.5,
+        setVolume() {},
+        next: async () => assert.equal(subscribed, true),
+        waitForSongChange: async () => { subscribed = true; },
+    });
+
+    await controller.startFallback("automatic");
+});
+
+test("fallback eligibility accepts ordinary music at the threshold", () => {
+    const item = { type: "track", uri: "spotify:track:123", isLocal: false };
+    assert.equal(GlideCore.isFallbackEligible(item, 5000, 175000, 180000), true);
+});
+
+test("fallback eligibility rejects unsupported and short content", () => {
+    const cases = [
+        { type: "episode", uri: "spotify:episode:1" },
+        { type: "ad", uri: "spotify:ad:1" },
+        { type: "track", uri: "spotify:local:artist:album:song" },
+        { type: "track", uri: "spotify:track:1", isLocal: true },
+    ];
+    for (const item of cases) {
+        assert.equal(GlideCore.isFallbackEligible(item, 5000, 175000, 180000), false);
+    }
+    assert.equal(
+        GlideCore.isFallbackEligible(
+            { type: "track", uri: "spotify:track:short" },
+            5000,
+            4000,
+            9000,
+        ),
+        false,
+    );
+});
+
+test("native automatic mode never starts fallback", async () => {
+    let starts = 0;
+    const started = await GlideCore.maybeStartAutomatic({
+        enabled: true,
+        nativeAutomatic: true,
+        item: { type: "track", uri: "spotify:track:1" },
+        durationMs: 5000,
+        progressMs: 175000,
+        totalMs: 180000,
+        startFallback: async () => { starts += 1; },
+    });
+    assert.equal(started, false);
+    assert.equal(starts, 0);
+});
+
+test("manual Next uses only an explicitly verified native transition", async () => {
+    let nativeCalls = 0;
+    let fallbackCalls = 0;
+    await GlideCore.requestNext({
+        nativeManual: true,
+        crossfadeToNext: async () => { nativeCalls += 1; },
+        startFallback: async () => { fallbackCalls += 1; },
+    });
+    assert.equal(nativeCalls, 1);
+    assert.equal(fallbackCalls, 0);
+
+    await GlideCore.requestNext({
+        nativeManual: false,
+        crossfadeToNext: async () => { nativeCalls += 1; },
+        startFallback: async () => { fallbackCalls += 1; },
+    });
+    assert.equal(nativeCalls, 1);
+    assert.equal(fallbackCalls, 1);
+});

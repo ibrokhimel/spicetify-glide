@@ -111,9 +111,10 @@ const GlideCore = (() => {
             try {
                 await animate(transition, halfDuration, fadeOutGain);
                 if (transition.token !== token) return;
+                const songChanged = deps.waitForSongChange();
                 await deps.next();
                 if (transition.token !== token) return;
-                await deps.waitForSongChange();
+                await songChanged;
                 if (transition.token !== token) return;
                 await animate(transition, halfDuration, fadeInGain);
             } finally {
@@ -131,6 +132,38 @@ const GlideCore = (() => {
         };
     };
 
+    const isFallbackEligible = (item, durationMs, progressMs, totalMs) => {
+        if (!item || item.type !== "track") return false;
+        if (item.isLocal || String(item.uri || "").startsWith("spotify:local:")) return false;
+        if (![durationMs, progressMs, totalMs].every(Number.isFinite)) return false;
+        if (durationMs <= 0 || totalMs < durationMs * 2) return false;
+        const remaining = totalMs - progressMs;
+        return remaining > 0 && remaining <= durationMs;
+    };
+
+    const maybeStartAutomatic = async (options) => {
+        if (!options.enabled || options.nativeAutomatic) return false;
+        if (!isFallbackEligible(
+            options.item,
+            options.durationMs,
+            options.progressMs,
+            options.totalMs,
+        )) {
+            return false;
+        }
+        await options.startFallback("automatic");
+        return true;
+    };
+
+    const requestNext = async (options) => {
+        if (options.nativeManual && typeof options.crossfadeToNext === "function") {
+            await options.crossfadeToNext();
+            return "native";
+        }
+        await options.startFallback("manual");
+        return "fallback";
+    };
+
     return {
         clampDuration,
         fadeOutGain,
@@ -138,6 +171,9 @@ const GlideCore = (() => {
         loadSettings,
         probeNativeCapability,
         createTransitionController,
+        isFallbackEligible,
+        maybeStartAutomatic,
+        requestNext,
     };
 })();
 
@@ -153,6 +189,7 @@ if (typeof Spicetify !== "undefined") {
         !Spicetify?.Player?.getProgress ||
         !Spicetify?.Player?.getDuration ||
         !Spicetify?.Player?.getVolume ||
+        !Spicetify?.Player?.setVolume ||
         !Spicetify?.Player?.next ||
         !Spicetify?.Player?.isPlaying ||
         !Spicetify?.Playbar ||
@@ -202,9 +239,29 @@ if (typeof Spicetify !== "undefined") {
     let hasSkipped = false;         // Prevents re-triggering for the same song
     let lastSkippedUri = null;      // URI of the song we triggered the skip from
     let spotifyCrossfadeStatus = "unknown"; // "enabled", "disabled", "unknown"
+    let capabilities = { automatic: false, manual: false };
+    let capabilityStatus = "checking";
+    let automaticTrackUri = null;
+    let songChangeWaiters = [];
+    const rawNext = Spicetify.Player.next.bind(Spicetify.Player);
+
+    const transitionController = GlideCore.createTransitionController({
+        durationMs: () => earlyStartSec * 1000,
+        now: () => performance.now(),
+        requestFrame: (callback) => requestAnimationFrame(callback),
+        getVolume: () => Spicetify.Player.getVolume(),
+        setVolume: (volume) => Spicetify.Player.setVolume(volume),
+        next: () => rawNext(),
+        waitForSongChange: () => new Promise((resolve) => songChangeWaiters.push(resolve)),
+    });
 
     // ─── Settings Persistence ────────────────────────────────────────
     function loadSettings() {
+        const loaded = GlideCore.loadSettings(Spicetify.LocalStorage);
+        isEnabled = loaded.enabled;
+        earlyStartSec = loaded.durationSec;
+        crossfadeSec = loaded.durationSec;
+        return;
         try {
             const e = Spicetify.LocalStorage.get(STORAGE.ENABLED);
             if (e !== null) isEnabled = e === "true";
@@ -231,6 +288,9 @@ if (typeof Spicetify !== "undefined") {
     }
 
     function saveSettings() {
+        Spicetify.LocalStorage.set("glide:enabled", String(isEnabled));
+        Spicetify.LocalStorage.set("glide:duration", String(earlyStartSec));
+        return;
         try {
             Spicetify.LocalStorage.set(STORAGE.ENABLED, String(isEnabled));
             Spicetify.LocalStorage.set("glide:smartGapless", String(smartGapless));
@@ -244,6 +304,16 @@ if (typeof Spicetify !== "undefined") {
     // ─── Zero-Touch Auto-Crossfade Guardian ──────────────────────────
     // Aggressively ensures Spotify's native crossfade is ON without user action.
     async function enforceCrossfade() {
+        if (!isEnabled) return false;
+        capabilityStatus = "checking";
+        capabilities = await GlideCore.probeNativeCapability(
+            Spicetify.Platform,
+            earlyStartSec,
+            { warn },
+        );
+        capabilityStatus = capabilities.automatic ? "native" : "fallback";
+        spotifyCrossfadeStatus = capabilities.automatic ? "enabled" : "disabled";
+        return capabilities.automatic;
         if (!isEnabled) return;
         const durationMs = crossfadeSec * 1000;
 
@@ -319,7 +389,21 @@ if (typeof Spicetify !== "undefined") {
     //   │  (starts with Spotify's native crossfade overlap)       │
     //   └────────────────────────────────────────────────────────┘
     //
+    async function requestManualNext() {
+        if (!isEnabled) return rawNext();
+        if (transitionController.state() === "fallback") {
+            return transitionController.cancel("repeated-next", { advance: true });
+        }
+        return GlideCore.requestNext({
+            nativeManual: capabilities.manual,
+            crossfadeToNext: () => Spicetify.Platform.PlayerAPI.crossfadeToNext(earlyStartSec),
+            startFallback: (reason) => transitionController.startFallback(reason),
+        });
+    }
+
     function triggerEarlySkip() {
+        requestManualNext().catch((error) => err("Manual transition failed:", error));
+        return;
         if (hasSkipped) return;
 
         const currentUri = Spicetify.Player?.data?.item?.uri || "";
@@ -351,7 +435,22 @@ if (typeof Spicetify !== "undefined") {
     }
 
     // ─── Progress Monitor ────────────────────────────────────────────
-    function checkProgress() {
+    async function checkProgress() {
+        if (!isEnabled || !Spicetify.Player.isPlaying()) return;
+        const item = Spicetify.Player.data?.item;
+        const uri = item?.uri || null;
+        if (!uri || automaticTrackUri === uri) return;
+        const started = await GlideCore.maybeStartAutomatic({
+            enabled: isEnabled,
+            nativeAutomatic: capabilities.automatic,
+            item,
+            durationMs: earlyStartSec * 1000,
+            progressMs: Spicetify.Player.getProgress(),
+            totalMs: Spicetify.Player.getDuration(),
+            startFallback: (reason) => transitionController.startFallback(reason),
+        });
+        if (started) automaticTrackUri = uri;
+        return;
         if (!isEnabled) return;
         if (!Spicetify.Player.isPlaying()) return;
         if (hasSkipped) return;
@@ -402,18 +501,22 @@ if (typeof Spicetify !== "undefined") {
 
     // Dual monitoring: onprogress events + heartbeat backup
     function onProgressChange() {
-        checkProgress();
+        checkProgress().catch((error) => err("Progress transition failed:", error));
     }
 
     let heartbeatId = null;
     function startHeartbeat() {
         if (heartbeatId) return;
-        heartbeatId = setInterval(checkProgress, HEARTBEAT_MS);
+        heartbeatId = setInterval(onProgressChange, HEARTBEAT_MS);
         log("Heartbeat started (" + HEARTBEAT_MS + "ms)");
     }
 
     // ─── Song Change Handler ─────────────────────────────────────────
     function onSongChange() {
+        automaticTrackUri = null;
+        const waiters = songChangeWaiters;
+        songChangeWaiters = [];
+        waiters.forEach((resolve) => resolve());
         // Reset skip state for the new song
         hasSkipped = false;
         log("Song changed — ready for next glide");
@@ -700,12 +803,22 @@ if (typeof Spicetify !== "undefined") {
     initPlaybarButton();
     initMenu();
 
-    // Try to enable Spotify's native crossfade
-    enforceCrossfade();
+    enforceCrossfade().catch((error) => err("Capability probe failed:", error));
+
+    try {
+        Spicetify.Player.next = requestManualNext;
+    } catch (error) {
+        warn("Manual Next interception unavailable:", error);
+    }
 
     // Register event listeners
     Spicetify.Player.addEventListener("onprogress", onProgressChange);
     Spicetify.Player.addEventListener("songchange", onSongChange);
+    Spicetify.Player.addEventListener("onplaypause", () => {
+        if (!Spicetify.Player.isPlaying()) {
+            transitionController.cancel("pause").catch((error) => err("Cancel failed:", error));
+        }
+    });
 
     // Start heartbeat backup
     startHeartbeat();
