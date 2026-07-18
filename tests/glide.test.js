@@ -246,6 +246,52 @@ test("cancel settles even when restoring volume throws", async () => {
     assert.equal(controller.state(), "idle");
 });
 
+test("animation-frame volume failure rejects and clears ownership", async () => {
+    let time = 0;
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => time,
+        requestFrame: (callback) => {
+            time += 250;
+            queueMicrotask(callback);
+        },
+        getVolume: () => 0.6,
+        setVolume: () => { throw new Error("volume write failed"); },
+        next: async () => {},
+        waitForSongChange: async () => true,
+        onError() {},
+    });
+
+    await assert.rejects(controller.startFallback("automatic"), /volume write failed/);
+    assert.equal(controller.state(), "idle");
+});
+
+test("only one overlapping automatic check acquires fallback ownership", () => {
+    const frames = [];
+    const controller = GlideCore.createTransitionController({
+        durationMs: () => 1000,
+        now: () => 0,
+        requestFrame: (callback) => frames.push(callback),
+        getVolume: () => 0.6,
+        setVolume() {},
+        next: async () => {},
+        waitForSongChange: async () => true,
+        onError() {},
+    });
+    const options = {
+        enabled: true,
+        nativeAutomatic: false,
+        item: { type: "track", uri: "spotify:track:1" },
+        durationMs: 1000,
+        progressMs: 9000,
+        totalMs: 10000,
+        startFallback: (reason) => controller.beginFallback(reason),
+    };
+
+    assert.equal(GlideCore.maybeStartAutomatic(options), true);
+    assert.equal(GlideCore.maybeStartAutomatic(options), false);
+});
+
 test("a repeated Next cancels fallback and advances exactly once", async () => {
     const frames = [];
     let advances = 0;
@@ -330,6 +376,44 @@ test("fallback eligibility rejects unsupported and short content", () => {
             9000,
         ),
         false,
+    );
+});
+
+test("fallback eligibility rejects unavailable and unplayable queued targets", () => {
+    const current = { type: "track", uri: "spotify:track:current" };
+    assert.equal(
+        GlideCore.isFallbackEligible(current, 5000, 175000, 180000, null),
+        false,
+    );
+    assert.equal(
+        GlideCore.isFallbackEligible(
+            current,
+            5000,
+            175000,
+            180000,
+            { uri: "spotify:track:next", isPlayable: false },
+        ),
+        false,
+    );
+    assert.equal(
+        GlideCore.isFallbackEligible(
+            current,
+            5000,
+            175000,
+            180000,
+            { contextTrack: { metadata: { is_playable: "false" } } },
+        ),
+        false,
+    );
+    assert.equal(
+        GlideCore.isFallbackEligible(
+            current,
+            5000,
+            175000,
+            180000,
+            { uri: "spotify:track:next", isPlayable: true },
+        ),
+        true,
     );
 });
 

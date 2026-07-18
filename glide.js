@@ -105,7 +105,7 @@ const GlideCore = (() => {
             }
         };
 
-        const animate = (transition, durationMs, gain) => new Promise((resolve) => {
+        const animate = (transition, durationMs, gain) => new Promise((resolve, reject) => {
             const startedAt = deps.now();
             transition.settle = resolve;
             const step = () => {
@@ -114,7 +114,13 @@ const GlideCore = (() => {
                     return;
                 }
                 const progress = Math.min(1, Math.max(0, (deps.now() - startedAt) / durationMs));
-                deps.setVolume(transition.volume * gain(progress));
+                try {
+                    deps.setVolume(transition.volume * gain(progress));
+                } catch (error) {
+                    transition.settle = null;
+                    reject(error);
+                    return;
+                }
                 if (progress >= 1) {
                     transition.settle = null;
                     resolve();
@@ -173,35 +179,52 @@ const GlideCore = (() => {
             }
         };
 
+        const beginFallback = (reason) => {
+            if (active) return false;
+            startFallback(reason).catch((error) => reportError(error));
+            return true;
+        };
+
         return {
             startFallback,
+            beginFallback,
             cancel,
             state: () => active ? "fallback" : "idle",
             expectsSongChange: () => active?.phase === "awaiting-change",
         };
     };
 
-    const isFallbackEligible = (item, durationMs, progressMs, totalMs) => {
+    const isPlayableTarget = (item) => {
+        if (!item) return false;
+        const metadata = item.contextTrack?.metadata || item.metadata || {};
+        if (item.isPlayable === false || item.is_playable === false) return false;
+        if (String(metadata.is_playable).toLowerCase() === "false") return false;
+        if (String(metadata.is_restricted).toLowerCase() === "true") return false;
+        return Boolean(item.uri || item.contextTrack?.uri || metadata.uri);
+    };
+
+    const isFallbackEligible = (item, durationMs, progressMs, totalMs, nextItem) => {
         if (!item || item.type !== "track") return false;
         if (item.isLocal || String(item.uri || "").startsWith("spotify:local:")) return false;
+        if (nextItem !== undefined && !isPlayableTarget(nextItem)) return false;
         if (![durationMs, progressMs, totalMs].every(Number.isFinite)) return false;
         if (durationMs <= 0 || totalMs < durationMs * 2) return false;
         const remaining = totalMs - progressMs;
         return remaining > 0 && remaining <= durationMs;
     };
 
-    const maybeStartAutomatic = async (options) => {
+    const maybeStartAutomatic = (options) => {
         if (!options.enabled || options.nativeAutomatic) return false;
         if (!isFallbackEligible(
             options.item,
             options.durationMs,
             options.progressMs,
             options.totalMs,
+            options.nextItem,
         )) {
             return false;
         }
-        await options.startFallback("automatic");
-        return true;
+        return options.startFallback("automatic") !== false;
     };
 
     const requestNext = async (options) => {
@@ -390,7 +413,7 @@ if (typeof Spicetify !== "undefined") {
     const checkProgress = async () => {
         if (!enabled || !Spicetify.Player.isPlaying()) return;
         const item = normalizedItem();
-        if (!item?.uri || automaticTrackUri === item.uri) return;
+        if (!item?.uri) return;
         const progressMs = Spicetify.Player.getProgress();
         const progressAt = performance.now();
         if (
@@ -410,14 +433,16 @@ if (typeof Spicetify !== "undefined") {
         }
         lastProgress = progressMs;
         lastProgressAt = progressAt;
-        const started = await GlideCore.maybeStartAutomatic({
+        if (automaticTrackUri === item.uri) return;
+        const started = GlideCore.maybeStartAutomatic({
             enabled,
             nativeAutomatic: capabilities.automatic,
             item,
+            nextItem: Spicetify.Queue?.nextTracks?.[0] ?? null,
             durationMs: durationSec * 1000,
             progressMs,
             totalMs: Spicetify.Player.getDuration(),
-            startFallback: (reason) => controller.startFallback(reason),
+            startFallback: (reason) => controller.beginFallback(reason),
         });
         if (started) automaticTrackUri = item.uri;
     };
